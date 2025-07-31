@@ -53,3 +53,15 @@ CATKIN_IGNORE
 .vscode/
 
 log/
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
