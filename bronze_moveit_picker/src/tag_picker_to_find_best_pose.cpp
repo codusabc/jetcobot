@@ -504,7 +504,7 @@ private:
         // std::vector<geometry_msgs::msg::Pose> lift_waypoints{lift_pose};
         // if (!executeCartesianPath(lift_waypoints, "lifting object")) {
         //     return false;
-        }
+        // }
         
         RCLCPP_INFO(get_logger(), "Pick operation completed for tag ID: %d", tag_id);
         std::this_thread::sleep_for(std::chrono::milliseconds(OPERATION_DELAY_MS));
