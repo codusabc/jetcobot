@@ -24,6 +24,8 @@ find_package(moveit_ros_perception REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(interactive_markers REQUIRED)
+find_package(apriltag_msgs REQUIRED) 
+find_package(jetcobot_interfaces REQUIRED) 
 
 # Optional packages - check if available
 find_package(rviz_visual_tools QUIET)
@@ -40,6 +42,8 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   moveit_ros_planning_interface
   interactive_markers
   moveit_ros_planning
+  apriltag_msgs
+  jetcobot_interfaces
 )
 
 # Add optional dependencies if found
@@ -59,6 +63,13 @@ target_include_directories(tag_picker_to_find_best_pose
 ament_target_dependencies(tag_picker_to_find_best_pose
     ${THIS_PACKAGE_INCLUDE_DEPENDS} Boost)
 
+add_executable(tag_picker_BoxCollision
+    src/tag_picker_BoxCollision.cpp)
+target_include_directories(tag_picker_BoxCollision
+    PUBLIC include)
+ament_target_dependencies(tag_picker_BoxCollision
+    ${THIS_PACKAGE_INCLUDE_DEPENDS} Boost)
+
 ament_python_install_package(${PROJECT_NAME})
 
 # Install Python executables as ROS 2 nodes
@@ -69,7 +80,7 @@ install(PROGRAMS
       DESTINATION lib/${PROJECT_NAME}
 )
 
-install(TARGETS tag_picker_to_find_best_pose
+install(TARGETS tag_picker_to_find_best_pose tag_picker_BoxCollision
     DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY launch
