@@ -1,5 +1,6 @@
 #include "bronze_moveit_picker/tag_picker.hpp"
 #include <thread>
+#include <cmath>
 
 // Constructor implementation
 TagPicker::TagPicker() : Node("tag_picker"),
@@ -9,6 +10,12 @@ TagPicker::TagPicker() : Node("tag_picker"),
 {
     // Create gripper command publisher
     gripper_pub_ = create_publisher<std_msgs::msg::Int32>("/gripper_command", 10);
+    
+    // Create static transform broadcaster
+    static_tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+    
+    // Create planning scene interface
+    planning_scene_interface_ = std::make_shared<moveit::planning_interface::PlanningSceneInterface>();
     
     // Create subscriber for AprilTag detections
     detection_sub_ = create_subscription<apriltag_msgs::msg::AprilTagDetectionArray>(
@@ -97,6 +104,12 @@ void TagPicker::execute_goal(const std::shared_ptr<GoalHandlePickerAction> goal_
     else if (goal->command == "SCAN_RIGHT") {
         success = handleScanRightCommand(goal_handle);
     }
+    else if (goal->command == "SCAN_PINKY") {
+        success = handleScanPinkyCommand(goal_handle);
+    }
+    else if (goal->command == "CLEAR_PINKY") {
+        success = handleClearPinkyCommand(goal_handle);
+    }
     else if (goal->command == "PICK_AND_PLACE") {
         success = handlePickAndPlaceCommand(goal_handle);
     }
@@ -139,6 +152,78 @@ bool TagPicker::getStoredTagTransform(int tag_id, geometry_msgs::msg::TransformS
         RCLCPP_ERROR(get_logger(), "No stored transform found for tag ID %d", tag_id);
         return false;
     }
+}
+
+bool TagPicker::getStoredPinkyTransform(const std::string& tf_name, geometry_msgs::msg::TransformStamped& pinky_transform)
+{
+    auto it = stored_pinky_transforms_.find(tf_name);
+    if (it != stored_pinky_transforms_.end()) {
+        pinky_transform = it->second;
+        RCLCPP_INFO(get_logger(), "Retrieved stored pinky transform for TF: %s", tf_name.c_str());
+        return true;
+    } else {
+        RCLCPP_ERROR(get_logger(), "No stored pinky transform found for TF: %s", tf_name.c_str());
+        return false;
+    }
+}
+
+bool TagPicker::storePinkyLoadpointTransforms(int tag_id)
+{
+    RCLCPP_INFO(get_logger(), "Storing pinky loadpoint transforms for tag ID: %d", tag_id);
+    
+    // Determine pinky namespace based on tag ID
+    std::string pinky_namespace;
+    if (tag_id == 31) {
+        pinky_namespace = "pinky1";
+    } else if (tag_id == 32) {
+        pinky_namespace = "pinky2";
+    } else if (tag_id == 33) {
+        pinky_namespace = "pinky3";
+    } else {
+        RCLCPP_WARN(get_logger(), "Unknown tag ID %d, using default pinky1", tag_id);
+        pinky_namespace = "pinky1";
+    }
+    
+    RCLCPP_INFO(get_logger(), "Using pinky namespace: %s for tag ID: %d", pinky_namespace.c_str(), tag_id);
+    
+    // List of pinky loadpoint TF frames to store
+    std::vector<std::string> pinky_frames = {
+        pinky_namespace + "/fl_loadpoint",
+        pinky_namespace + "/fr_loadpoint", 
+        pinky_namespace + "/rl_loadpoint",
+        pinky_namespace + "/rr_loadpoint"
+    };
+    
+    int successful_stores = 0;
+    
+    for (const std::string& frame_name : pinky_frames) {
+        try {
+            geometry_msgs::msg::TransformStamped pinky_transform = tf_buffer_->lookupTransform(
+                "base_link",  // target frame
+                frame_name,   // source frame  
+                tf2::TimePointZero,  // get latest available
+                std::chrono::seconds(1));
+            
+            // Store the pinky transform
+            stored_pinky_transforms_[frame_name] = pinky_transform;
+            successful_stores++;
+            
+            RCLCPP_INFO(get_logger(), "Stored pinky transform for %s: x=%.3f, y=%.3f, z=%.3f", 
+                       frame_name.c_str(),
+                       pinky_transform.transform.translation.x,
+                       pinky_transform.transform.translation.y,
+                       pinky_transform.transform.translation.z);
+        }
+        catch (tf2::TransformException &ex) {
+            RCLCPP_WARN(get_logger(), "Could not store transform for pinky frame %s: %s", 
+                       frame_name.c_str(), ex.what());
+        }
+    }
+    
+    RCLCPP_INFO(get_logger(), "Successfully stored %d out of %zu pinky loadpoint transforms for %s", 
+               successful_stores, pinky_frames.size(), pinky_namespace.c_str());
+    
+    return successful_stores > 0;
 }
 
 void TagPicker::detectionCallback(const apriltag_msgs::msg::AprilTagDetectionArray::SharedPtr msg)
@@ -232,11 +317,16 @@ bool TagPicker::collectDetectedTagsAndAcquireTransforms(double collection_time_s
 
 void TagPicker::PublishBoxCollisionObject()
 {
-        // 1) 한꺼번에 보낼 CollisionObject들을 담을 벡터
+    // 1) 한꺼번에 보낼 CollisionObject들을 담을 벡터
     std::vector<moveit_msgs::msg::CollisionObject> col_objs, to_remove_objs;
 
-    // 2) 이미 확보해 둔 태그-변환 맵을 순회
+    // 2) 이미 확보해 둔 태그-변환 맵을 순회 (1-30번 태그만 collision box 생성)
     for (auto& [id, tf] : stored_tag_transforms_) {
+        // Skip tags outside the range 1-30 (pinky tags 31-33 don't need collision boxes)
+        if (id < 1 || id > 30) {
+            RCLCPP_DEBUG(get_logger(), "Skipping collision box for tag ID %d (outside range 1-30)", id);
+            continue;
+        }
 
         moveit_msgs::msg::CollisionObject collision_object;
         collision_object.header.frame_id = "base_link";                 // 좌표계 기준
@@ -258,14 +348,30 @@ void TagPicker::PublishBoxCollisionObject()
 
         collision_object.operation         = collision_object.ADD;   // 처음엔 ADD.
 
-
         col_objs.push_back(collision_object);               // 목록에 누적
+        RCLCPP_INFO(get_logger(), "Adding collision box for tag ID %d", id);
     }
 
     /* ---------- (C) 이전에 있던 태그 박스 제거 ---------- */
     static std::set<int> prev_ids;
     std::set<int> curr_ids;
-    for (const auto& [id, _] : stored_tag_transforms_) curr_ids.insert(id);
+    // Only track tags in range 1-30 for collision objects
+    for (const auto& [id, _] : stored_tag_transforms_) {
+        if (id >= 1 && id <= 30) {
+            curr_ids.insert(id);
+        }
+    }
+
+    // Debug logging
+    RCLCPP_INFO(get_logger(), "Previous tag IDs (%zu): ", prev_ids.size());
+    for (int id : prev_ids) {
+        RCLCPP_INFO(get_logger(), "  - Previous ID: %d", id);
+    }
+    
+    RCLCPP_INFO(get_logger(), "Current tag IDs (%zu): ", curr_ids.size());
+    for (int id : curr_ids) {
+        RCLCPP_INFO(get_logger(), "  - Current ID: %d", id);
+    }
 
     for (int old_id : prev_ids) {
         if (!curr_ids.count(old_id)) {
@@ -274,16 +380,82 @@ void TagPicker::PublishBoxCollisionObject()
             rm.id              = "tag_box_" + std::to_string(old_id);
             rm.operation       = rm.REMOVE;
             to_remove_objs.push_back(rm);
+            RCLCPP_INFO(get_logger(), "Removing collision box for tag ID %d", old_id);
         }
     }
     prev_ids = std::move(curr_ids);
 
     /* ---------- (C) PlanningScene 반영 ---------- */
-    if (!col_objs.empty())
-        planning_scene_interface_.applyCollisionObjects(col_objs);
-    if (!to_remove_objs.empty())
-        planning_scene_interface_.applyCollisionObjects(to_remove_objs);
+    if (!col_objs.empty()) {
+        RCLCPP_INFO(get_logger(), "Applying %zu collision objects to add", col_objs.size());
+        planning_scene_interface_->applyCollisionObjects(col_objs);
+    }
+    if (!to_remove_objs.empty()) {
+        RCLCPP_INFO(get_logger(), "Applying %zu collision objects to remove", to_remove_objs.size());
+        planning_scene_interface_->applyCollisionObjects(to_remove_objs);
+    }
+    
+    if (col_objs.empty() && to_remove_objs.empty()) {
+        RCLCPP_INFO(get_logger(), "No collision objects to add or remove");
+    }
 }
+
+void TagPicker::attachBoxToGripper(int tag_id)
+{
+    std::string object_id = "tag_box_" + std::to_string(tag_id);
+    
+    // Create the attached collision object with the SAME ID as the world object
+    // MoveIt will automatically convert from world to attached object
+    moveit_msgs::msg::AttachedCollisionObject attached_object;
+    attached_object.link_name = "TCP";  // Attach to TCP link
+    attached_object.object.header.frame_id = "TCP";
+    attached_object.object.id = object_id;  // Use same ID - MoveIt handles the conversion
+    
+    // Define the box shape
+    shape_msgs::msg::SolidPrimitive box;
+    box.type = box.BOX;
+    box.dimensions = {0.03, 0.03, 0.03};  // Same size as original collision box
+    attached_object.object.primitives = {box};
+    
+    // Position relative to TCP (box center at TCP position)
+    geometry_msgs::msg::Pose box_pose;
+    box_pose.position.x = 0.0;
+    box_pose.position.y = 0.0;
+    box_pose.position.z = 0.0;  // At TCP position
+    box_pose.orientation.x = 0.0;
+    box_pose.orientation.y = 0.0;
+    box_pose.orientation.z = 0.0;
+    box_pose.orientation.w = 1.0;
+    attached_object.object.primitive_poses = {box_pose};
+    
+    // Set operation to ADD
+    attached_object.object.operation = attached_object.object.ADD;
+    
+    // Define touch links (links that are allowed to touch this object)
+    attached_object.touch_links = {"TCP", "gripper_link"};  // Add actual gripper link names
+    
+    // Apply the attached object - MoveIt will automatically remove from world and attach
+    planning_scene_interface_->applyAttachedCollisionObject(attached_object);
+    
+    RCLCPP_INFO(get_logger(), "Attached box collision object %s to TCP (MoveIt auto-converted from world)", object_id.c_str());
+}
+
+void TagPicker::detachBoxFromGripper(int tag_id)
+{
+    // Remove the attached collision object using the same ID
+    std::string object_id = "tag_box_" + std::to_string(tag_id);
+    
+    moveit_msgs::msg::AttachedCollisionObject detach_object;
+    detach_object.link_name = "TCP";
+    detach_object.object.id = object_id;  // Use same ID as when attached
+    detach_object.object.operation = detach_object.object.REMOVE;
+    
+    // Apply the detachment
+    planning_scene_interface_->applyAttachedCollisionObject(detach_object);
+    
+    RCLCPP_INFO(get_logger(), "Detached box collision object %s from TCP", object_id.c_str());
+}
+
 
 std::set<int> TagPicker::getDetectedTagIds() const
 {
@@ -643,7 +815,7 @@ bool TagPicker::executePick(int tag_id)
     for (size_t i = 0; i < final_target_poses.size(); ++i) {
         RCLCPP_INFO(get_logger(), "Attempting final approach %zu/%zu (X-rotation: %d°)", 
                    i + 1, final_target_poses.size(), angles[i]);
-        final_target_poses[i].orientation = current_ee_orientation;  // Maintain current EEF orientation
+        // final_target_poses[i].orientation = current_ee_orientation;  // Maintain current EEF orientation
     // Move to final position using Cartesian path
         std::vector<geometry_msgs::msg::Pose> approach_waypoints{final_target_poses[i]};
         if (executeCartesianPath(approach_waypoints, "final approach to tag")) {
@@ -667,7 +839,14 @@ bool TagPicker::executePick(int tag_id)
     // Close gripper
     closeGripperToPicking();
 
-    // Lift object - use the successful pose for lifting
+    // Immediately attach the picked object to gripper (removes world collision object and attaches to robot)
+    RCLCPP_INFO(get_logger(), "Attaching picked object to gripper...");
+    attachBoxToGripper(tag_id);
+    
+    // Remove from stored transforms to prevent re-creation of world collision object
+    stored_tag_transforms_.erase(tag_id);
+
+    // Lift object with the attached collision object
     if (!executeLiftMovement(MovementConstants::LIFT_HEIGHT)) {
         return false;
     }
@@ -719,14 +898,22 @@ bool TagPicker::executePlace(int target_tag_id, int source_tag_id)
     // Open gripper to release object
     openGripperToHoldingPosition();
 
+    // Detach the object from gripper and place it as collision object at new location
+    RCLCPP_INFO(get_logger(), "Detaching object from gripper and placing at new location...");
+    detachBoxFromGripper(source_tag_id);
+
     // Move up to lift position
     if (!executeLiftMovement(MovementConstants::APPROACH_HEIGHT)) {
         return false;
     }
-    
+
     // Update stored tag pose after successful placement
     RCLCPP_INFO(get_logger(), "Updating stored pose for placed source tag ID %d (now at target position)...", source_tag_id);
     updateStoredTagIfVisible(source_tag_id);
+    
+    // Update collision objects after placing - update the placed object's collision box position
+    RCLCPP_INFO(get_logger(), "Updating collision objects after place operation...");
+    PublishBoxCollisionObject();
     
     RCLCPP_INFO(get_logger(), "Place operation completed: source tag %d placed at target tag %d position", source_tag_id, target_tag_id);
     std::this_thread::sleep_for(std::chrono::milliseconds(TimingConstants::OPERATION_DELAY_MS));
@@ -740,6 +927,16 @@ bool TagPicker::executePlace(const std::string& target_tf_name, int source_tag_i
     
     // Get transform for the specified TF frame
     geometry_msgs::msg::TransformStamped target_transform;
+    
+    // First, try to get stored pinky transform
+    if (getStoredPinkyTransform(target_tf_name, target_transform)) {
+        RCLCPP_INFO(get_logger(), "Using stored pinky transform for TF frame: %s at position: x=%.3f, y=%.3f, z=%.3f", 
+                   target_tf_name.c_str(),
+                   target_transform.transform.translation.x,
+                   target_transform.transform.translation.y,
+                   target_transform.transform.translation.z);
+    } else {
+        // If not found in stored pinky transforms, try to lookup from TF buffer
     try {
         target_transform = tf_buffer_->lookupTransform(
             "base_link",  // target frame
@@ -747,15 +944,17 @@ bool TagPicker::executePlace(const std::string& target_tf_name, int source_tag_i
             tf2::TimePointZero,  // get latest available
             std::chrono::seconds(1));
         
-        RCLCPP_INFO(get_logger(), "Found TF frame: %s at position: x=%.3f, y=%.3f, z=%.3f", 
+            RCLCPP_INFO(get_logger(), "Found TF frame from buffer: %s at position: x=%.3f, y=%.3f, z=%.3f", 
                    target_tf_name.c_str(),
                    target_transform.transform.translation.x,
                    target_transform.transform.translation.y,
                    target_transform.transform.translation.z);
     }
     catch (tf2::TransformException &ex) {
-        RCLCPP_ERROR(get_logger(), "Failed to find TF frame %s: %s", target_tf_name.c_str(), ex.what());
+            RCLCPP_ERROR(get_logger(), "Failed to find TF frame %s in both stored pinky transforms and TF buffer: %s", 
+                        target_tf_name.c_str(), ex.what());
         return false;
+        }
     }
 
     // First, move to approach position (APPROACH_HEIGHT above the target frame)
@@ -797,6 +996,10 @@ bool TagPicker::executePlace(const std::string& target_tf_name, int source_tag_i
     // Open gripper to release object
     openGripperToHoldingPosition();
     
+    // Detach the object from gripper and place it as collision object at new location
+    RCLCPP_INFO(get_logger(), "Detaching object from gripper and placing at new location...");
+    detachBoxFromGripper(source_tag_id);
+    
     // Move up to lift position after placing
     if (!executeLiftMovement(MovementConstants::APPROACH_HEIGHT)) {
         return false;
@@ -805,6 +1008,10 @@ bool TagPicker::executePlace(const std::string& target_tf_name, int source_tag_i
     // Update stored tag pose after successful placement
     RCLCPP_INFO(get_logger(), "Updating stored pose for placed source tag ID %d (now at TF frame position)...", source_tag_id);
     updateStoredTagIfVisible(source_tag_id);
+    
+    // Update collision objects after placing - update the placed object's collision box position
+    RCLCPP_INFO(get_logger(), "Updating collision objects after place operation...");
+    PublishBoxCollisionObject();
     
     RCLCPP_INFO(get_logger(), "Place operation completed: source tag %d placed at TF frame: %s", source_tag_id, target_tf_name.c_str());
     std::this_thread::sleep_for(std::chrono::milliseconds(TimingConstants::OPERATION_DELAY_MS));
@@ -843,11 +1050,13 @@ bool TagPicker::handleScanCommand(const std::shared_ptr<GoalHandlePickerAction> 
     
     bool success = collectDetectedTagsAndAcquireTransforms(TimingConstants::TAG_COLLECTION_TIME);
     
+    // Always update collision objects regardless of success/failure to remove old boxes
+    PublishBoxCollisionObject();        // Add collision boxes to planning scene
+    printDetectedTags();
+    
     if (!success) {
         RCLCPP_ERROR(get_logger(), "SCAN command failed - no tags detected");
     } else {
-        PublishBoxCollisionObject();        // Add collision boxes to planning scene
-        printDetectedTags();
         RCLCPP_INFO(get_logger(), "SCAN command completed successfully");
     }
     
@@ -874,11 +1083,19 @@ bool TagPicker::handleScanFrontCommand(const std::shared_ptr<GoalHandlePickerAct
     
     bool success = collectDetectedTagsAndAcquireTransforms(TimingConstants::TAG_COLLECTION_TIME);
     
+    // Always update collision objects regardless of success/failure to remove old boxes
+    PublishBoxCollisionObject();        // Add collision boxes to planning scene
+    printDetectedTags();
+    
     if (!success) {
         RCLCPP_ERROR(get_logger(), "SCAN_FRONT command failed - no tags detected");
     } else {
-        PublishBoxCollisionObject();        // Add collision boxes to planning scene
-        printDetectedTags();
+        // Publish ground-projected transforms for front tags
+        publishGroundProjectedTransforms(-1);  // -1 indicates SCAN_FRONT command
+        
+        // Create collision objects at pinky bag poses
+        createCollisionObjectsAtPinkyBagPoses(-1);  // -1 indicates SCAN_FRONT command
+        
         RCLCPP_INFO(get_logger(), "SCAN_FRONT command completed successfully");
     }
     
@@ -905,11 +1122,13 @@ bool TagPicker::handleScanLeftCommand(const std::shared_ptr<GoalHandlePickerActi
     
     bool success = collectDetectedTagsAndAcquireTransforms(TimingConstants::TAG_COLLECTION_TIME);
     
+    // Always update collision objects regardless of success/failure to remove old boxes
+    PublishBoxCollisionObject();        // Add collision boxes to planning scene
+    printDetectedTags();
+    
     if (!success) {
         RCLCPP_ERROR(get_logger(), "SCAN_LEFT command failed - no tags detected");
     } else {
-        PublishBoxCollisionObject();        // Add collision boxes to planning scene
-        printDetectedTags();
         RCLCPP_INFO(get_logger(), "SCAN_LEFT command completed successfully");
     }
     
@@ -936,15 +1155,501 @@ bool TagPicker::handleScanRightCommand(const std::shared_ptr<GoalHandlePickerAct
     
     bool success = collectDetectedTagsAndAcquireTransforms(TimingConstants::TAG_COLLECTION_TIME);
     
+    // Always update collision objects regardless of success/failure to remove old boxes
+    PublishBoxCollisionObject();        // Add collision boxes to planning scene
+    printDetectedTags();
+    
     if (!success) {
         RCLCPP_ERROR(get_logger(), "SCAN_RIGHT command failed - no tags detected");
     } else {
-        PublishBoxCollisionObject();        // Add collision boxes to planning scene
-        printDetectedTags();
         RCLCPP_INFO(get_logger(), "SCAN_RIGHT command completed successfully");
     }
     
     return success;
+}
+
+bool TagPicker::handleScanPinkyCommand(const std::shared_ptr<GoalHandlePickerAction> goal_handle)
+{
+    const auto goal = goal_handle->get_goal();
+    RCLCPP_INFO(get_logger(), "Executing SCAN_PINKY command for tag ID: %d", goal->source_tag_id);
+    
+    auto feedback = std::make_shared<PickerAction::Feedback>();
+    feedback->current_phase = "pinky_scanning";
+    feedback->current_tag_id = goal->source_tag_id;
+    goal_handle->publish_feedback(feedback);
+    
+    // Check if we have a stored transform for the target tag
+    geometry_msgs::msg::TransformStamped tag_transform;
+    if (!getStoredTagTransform(goal->source_tag_id, tag_transform)) {
+        RCLCPP_ERROR(get_logger(), "Cannot find stored transform for tag ID %d. Run SCAN command first.", goal->source_tag_id);
+        return false;
+    }
+    
+    // Move to the tag's position to get a more precise pose
+    feedback->current_phase = "approaching_target";
+    goal_handle->publish_feedback(feedback);
+    
+    if (!moveToReacquireTagPosition(tag_transform, goal->source_tag_id)) {
+        RCLCPP_ERROR(get_logger(), "Failed to move to scan position for tag %d", goal->source_tag_id);
+        return false;
+    }
+    
+    // Wait a moment for the tag detection to stabilize
+    feedback->current_phase = "updating_poses";
+    goal_handle->publish_feedback(feedback);
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(TimingConstants::STABILIZE_DELAY_MS));
+    
+    // Try to update the stored tag pose with more precise data
+    bool tag_update_success = updateStoredTagIfVisible(goal->source_tag_id);
+    
+    // Store pinky loadpoint transforms
+    bool pinky_store_success = storePinkyLoadpointTransforms(goal->source_tag_id);
+    
+    if (tag_update_success) {
+        // Get the updated transform to log the new position
+        geometry_msgs::msg::TransformStamped updated_transform;
+        if (getStoredTagTransform(goal->source_tag_id, updated_transform)) {
+            RCLCPP_INFO(get_logger(), "Updated tag position: x=%.3f, y=%.3f, z=%.3f", 
+                       updated_transform.transform.translation.x,
+                       updated_transform.transform.translation.y,
+                       updated_transform.transform.translation.z);
+        }
+    } else {
+        RCLCPP_WARN(get_logger(), "Could not update tag pose for tag ID %d", goal->source_tag_id);
+    }
+    
+    if (pinky_store_success) {
+        RCLCPP_INFO(get_logger(), "Successfully stored pinky loadpoint transforms");
+    } else {
+        RCLCPP_WARN(get_logger(), "Could not store all pinky loadpoint transforms");
+    }
+    
+    // Consider success if either tag or pinky transforms were stored
+    bool overall_success = tag_update_success || pinky_store_success;
+    
+    if (overall_success) {
+        // Publish ground-projected transforms for pinky frames
+        publishGroundProjectedTransforms(goal->source_tag_id);
+        
+        // Create collision objects at pinky bag poses (only if tag is visible)
+        if (tag_update_success) {
+            createCollisionObjectsAtPinkyBagPoses(goal->source_tag_id);
+        }
+        
+        RCLCPP_INFO(get_logger(), "SCAN_PINKY command completed successfully for tag ID %d", goal->source_tag_id);
+    } else {
+        RCLCPP_ERROR(get_logger(), "SCAN_PINKY failed - could not update poses for tag ID %d", goal->source_tag_id);
+        return false;
+    }
+    
+    return overall_success;
+}
+
+bool TagPicker::handleClearPinkyCommand(const std::shared_ptr<GoalHandlePickerAction> goal_handle)
+{
+    RCLCPP_INFO(get_logger(), "Executing CLEAR_PINKY command");
+    
+    auto feedback = std::make_shared<PickerAction::Feedback>();
+    feedback->current_phase = "clearing_pinky_data";
+    feedback->current_tag_id = -1;
+    goal_handle->publish_feedback(feedback);
+    
+    // Clear all pinky-related static transforms
+    std::vector<std::string> pinky_frames_to_clear = {
+        "pinky1/pinky_bag",
+        "pinky2/pinky_bag", 
+        "pinky3/pinky_bag",
+        "pinky1/front_frame",
+        "pinky2/front_frame",
+        "pinky3/front_frame",
+        "pinky1/pinky_loadpoint",
+        "pinky2/pinky_loadpoint",
+        "pinky3/pinky_loadpoint"
+    };
+    
+    // Remove static transforms by publishing them with a very old timestamp
+    for (const std::string& frame_name : pinky_frames_to_clear) {
+        if (published_static_frames_.find(frame_name) != published_static_frames_.end()) {
+            // Create an "empty" transform with old timestamp to remove the frame
+            geometry_msgs::msg::TransformStamped remove_transform;
+            remove_transform.header.stamp = rclcpp::Time(0, 0, get_clock()->get_clock_type()); // Very old timestamp
+            remove_transform.header.frame_id = "base_link";
+            remove_transform.child_frame_id = frame_name;
+            
+            // Set identity transform
+            remove_transform.transform.translation.x = 0.0;
+            remove_transform.transform.translation.y = 0.0;
+            remove_transform.transform.translation.z = 0.0;
+            remove_transform.transform.rotation.x = 0.0;
+            remove_transform.transform.rotation.y = 0.0;
+            remove_transform.transform.rotation.z = 0.0;
+            remove_transform.transform.rotation.w = 1.0;
+            
+            // Publish the old transform to effectively remove it
+            static_tf_broadcaster_->sendTransform(remove_transform);
+            
+            // Remove from our tracking set
+            published_static_frames_.erase(frame_name);
+            
+            RCLCPP_INFO(get_logger(), "Removed static transform: %s", frame_name.c_str());
+        }
+    }
+    
+    // Clear all pinky-related collision objects
+    std::vector<std::string> collision_ids_to_remove = {
+        "pinky1_bag_collision",
+        "pinky2_bag_collision", 
+        "pinky3_bag_collision"
+    };
+    
+    planning_scene_interface_->removeCollisionObjects(collision_ids_to_remove);
+    
+    // Clear stored pinky transforms
+    auto it = stored_pinky_transforms_.begin();
+    while (it != stored_pinky_transforms_.end()) {
+        if (it->first.find("pinky") != std::string::npos) {
+            RCLCPP_INFO(get_logger(), "Removed stored pinky transform: %s", it->first.c_str());
+            it = stored_pinky_transforms_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    
+    RCLCPP_INFO(get_logger(), "CLEAR_PINKY command completed successfully - removed %zu static transforms, %zu collision objects, and cleared stored pinky transforms", 
+               pinky_frames_to_clear.size(), collision_ids_to_remove.size());
+    
+    return true;
+}
+
+std::vector<double> TagPicker::eulerFromQuaternion(double x, double y, double z, double w)
+{
+    // Roll (x-axis rotation)
+    double sinr_cosp = 2.0 * (w * x + y * z);
+    double cosr_cosp = 1.0 - 2.0 * (x * x + y * y);
+    double roll = std::atan2(sinr_cosp, cosr_cosp);
+    
+    // Pitch (y-axis rotation)
+    double sinp = 2.0 * (w * y - z * x);
+    double pitch;
+    if (std::abs(sinp) >= 1) {
+        pitch = std::copysign(M_PI / 2.0, sinp); // use 90 degrees if out of range
+    } else {
+        pitch = std::asin(sinp);
+    }
+    
+    // Yaw (z-axis rotation)
+    double siny_cosp = 2.0 * (w * z + x * y);
+    double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
+    double yaw = std::atan2(siny_cosp, cosy_cosp);
+    
+    return {roll, pitch, yaw};
+}
+
+std::vector<double> TagPicker::quaternionFromEuler(double roll, double pitch, double yaw)
+{
+    double cy = std::cos(yaw * 0.5);
+    double sy = std::sin(yaw * 0.5);
+    double cp = std::cos(pitch * 0.5);
+    double sp = std::sin(pitch * 0.5);
+    double cr = std::cos(roll * 0.5);
+    double sr = std::sin(roll * 0.5);
+    
+    double w = cr * cp * cy + sr * sp * sy;
+    double x = sr * cp * cy - cr * sp * sy;
+    double y = cr * sp * cy + sr * cp * sy;
+    double z = cr * cp * sy - sr * sp * cy;
+    
+    return {x, y, z, w};
+}
+
+geometry_msgs::msg::TransformStamped TagPicker::createGroundProjectedTransform(
+    const geometry_msgs::msg::TransformStamped& original_transform,
+    const std::string& output_frame_id)
+{
+    // Extract original position and orientation
+    const auto& translation = original_transform.transform.translation;
+    const auto& rotation = original_transform.transform.rotation;
+    
+    // Convert quaternion to euler angles
+    auto euler = eulerFromQuaternion(rotation.x, rotation.y, rotation.z, rotation.w);
+    double roll = euler[0];
+    double pitch = euler[1]; 
+    double yaw = euler[2];
+    
+    // Create new quaternion with only yaw rotation (roll=0, pitch=0)
+    auto new_quat = quaternionFromEuler(0.0, 0.0, yaw);
+    
+    // Create new transform message
+    geometry_msgs::msg::TransformStamped ground_transform;
+    ground_transform.header.stamp = this->get_clock()->now();
+    ground_transform.header.frame_id = original_transform.header.frame_id;
+    ground_transform.child_frame_id = output_frame_id;
+    
+    // Keep x, y translation, maintain z (don't force to ground level)
+    ground_transform.transform.translation.x = translation.x;
+    ground_transform.transform.translation.y = translation.y;
+    ground_transform.transform.translation.z = translation.z;
+    
+    // Set orientation with only yaw
+    ground_transform.transform.rotation.x = new_quat[0];
+    ground_transform.transform.rotation.y = new_quat[1];
+    ground_transform.transform.rotation.z = new_quat[2];
+    ground_transform.transform.rotation.w = new_quat[3];
+    
+    return ground_transform;
+}
+
+void TagPicker::publishGroundProjectedTransforms(int source_tag_id)
+{
+    // Define the frames to project based on command type
+    std::vector<std::pair<std::string, std::string>> frame_mappings; // source frame, target frame
+    
+    if (source_tag_id == -1) {
+        // SCAN_FRONT command - project tags 31, 32, 33 to pinky pinky_bag frames
+        frame_mappings = {
+            {"tagStandard41h12:31", "pinky1/pinky_bag"},
+            {"tagStandard41h12:32", "pinky2/pinky_bag"},
+            {"tagStandard41h12:33", "pinky3/pinky_bag"}
+        };
+    } else if (source_tag_id == 31 || source_tag_id == 32 || source_tag_id == 33) {
+        // SCAN_PINKY command - project tag frames to pinky_bag frames
+        std::string tag_frame = "tagStandard41h12:" + std::to_string(source_tag_id);
+        std::string pinky_namespace = (source_tag_id == 31) ? "pinky1" : 
+                                    (source_tag_id == 32) ? "pinky2" : "pinky3";
+        
+        frame_mappings = {
+            {tag_frame, pinky_namespace + "/pinky_bag"}
+        };
+    } else {
+        RCLCPP_WARN(get_logger(), "No ground projection defined for tag ID %d", source_tag_id);
+        return;
+    }
+    
+    // Project and publish each frame
+    for (const auto& mapping : frame_mappings) {
+        const std::string& source_frame = mapping.first;
+        const std::string& target_frame = mapping.second;
+        
+        try {
+            // Get the current transform
+            geometry_msgs::msg::TransformStamped transform = 
+                tf_buffer_->lookupTransform("base_link", source_frame, tf2::TimePointZero, tf2::durationFromSec(1.0));
+            
+            // Create ground-projected version
+            auto ground_transform = createGroundProjectedTransform(transform, target_frame);
+            
+            // Publish as static transform
+            static_tf_broadcaster_->sendTransform(ground_transform);
+            
+            // Track the published frame for potential removal
+            published_static_frames_.insert(target_frame);
+            
+            RCLCPP_INFO(get_logger(), "Published ground-projected transform: %s -> %s", 
+                       source_frame.c_str(), target_frame.c_str());
+            
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_WARN(get_logger(), "Could not get transform for %s: %s", source_frame.c_str(), ex.what());
+        }
+    }
+}
+
+void TagPicker::removeStaticTransformsForMissingTags(int source_tag_id)
+{
+    // Define the frames to remove based on command type
+    std::vector<std::string> frames_to_check;
+    
+    if (source_tag_id == -1) {
+        // SCAN_FRONT command - check which tags 31, 32, 33 are missing
+        std::vector<int> expected_tags = {31, 32, 33};
+        std::vector<std::string> pinky_frames = {"pinky1/pinky_bag", "pinky2/pinky_bag", "pinky3/pinky_bag"};
+        
+        for (size_t i = 0; i < expected_tags.size(); i++) {
+            int tag_id = expected_tags[i];
+            const std::string& frame_name = pinky_frames[i];
+            
+            // Check if this tag was detected
+            if (detected_tag_ids_.find(tag_id) == detected_tag_ids_.end()) {
+                // Tag not detected, remove its static transform
+                frames_to_check.push_back(frame_name);
+            }
+        }
+    } else if (source_tag_id == 31 || source_tag_id == 32 || source_tag_id == 33) {
+        // SCAN_PINKY command - check if the specific tag is missing
+        if (detected_tag_ids_.find(source_tag_id) == detected_tag_ids_.end()) {
+            std::string pinky_namespace = (source_tag_id == 31) ? "pinky1" : 
+                                        (source_tag_id == 32) ? "pinky2" : "pinky3";
+            frames_to_check.push_back(pinky_namespace + "/front_frame");
+            frames_to_check.push_back(pinky_namespace + "/pinky_loadpoint");
+        }
+    }
+    
+    // Remove static transforms by publishing them with a very old timestamp
+    // This effectively removes them from the TF tree
+    for (const std::string& frame_name : frames_to_check) {
+        if (published_static_frames_.find(frame_name) != published_static_frames_.end()) {
+            // Create an "empty" transform with old timestamp to remove the frame
+            geometry_msgs::msg::TransformStamped remove_transform;
+            remove_transform.header.stamp = rclcpp::Time(0, 0, get_clock()->get_clock_type()); // Very old timestamp
+            remove_transform.header.frame_id = "base_link";
+            remove_transform.child_frame_id = frame_name;
+            
+            // Set identity transform
+            remove_transform.transform.translation.x = 0.0;
+            remove_transform.transform.translation.y = 0.0;
+            remove_transform.transform.translation.z = 0.0;
+            remove_transform.transform.rotation.x = 0.0;
+            remove_transform.transform.rotation.y = 0.0;
+            remove_transform.transform.rotation.z = 0.0;
+            remove_transform.transform.rotation.w = 1.0;
+            
+            // Publish the old transform to effectively remove it
+            static_tf_broadcaster_->sendTransform(remove_transform);
+            
+            // Remove from our tracking set
+            published_static_frames_.erase(frame_name);
+            
+            RCLCPP_INFO(get_logger(), "Removed static transform for missing tag: %s", frame_name.c_str());
+        }
+    }
+    
+    if (!frames_to_check.empty()) {
+        RCLCPP_INFO(get_logger(), "Removed %zu static transforms for missing tags", frames_to_check.size());
+    } else {
+        RCLCPP_DEBUG(get_logger(), "No static transforms to remove - all expected tags detected");
+    }
+}
+
+void TagPicker::createCollisionObjectsAtPinkyBagPoses(int source_tag_id)
+{
+    // Define the frames to create collisions based on command type
+    std::vector<std::pair<std::string, std::string>> collision_mappings; // frame to look up, collision object ID
+    
+    if (source_tag_id == -1) {
+        // SCAN_FRONT command - create collisions for pinky1/2/3 pinky_bag frames
+        collision_mappings = {
+            {"pinky1/pinky_bag", "pinky1_bag_collision"},
+            {"pinky2/pinky_bag", "pinky2_bag_collision"},
+            {"pinky3/pinky_bag", "pinky3_bag_collision"}
+        };
+    } else if (source_tag_id == 31 || source_tag_id == 32 || source_tag_id == 33) {
+        // SCAN_PINKY command - create collision for specific pinky bag
+        std::string pinky_namespace = (source_tag_id == 31) ? "pinky1" : 
+                                    (source_tag_id == 32) ? "pinky2" : "pinky3";
+        
+        collision_mappings = {
+            {pinky_namespace + "/pinky_bag", pinky_namespace + "_bag_collision"}
+        };
+    } else {
+        RCLCPP_WARN(get_logger(), "No collision objects defined for tag ID %d", source_tag_id);
+        return;
+    }
+    
+    // Create collision objects at each frame
+    std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
+    
+    for (const auto& mapping : collision_mappings) {
+        const std::string& frame_name = mapping.first;
+        const std::string& collision_id = mapping.second;
+        
+        try {
+            // Get the current transform for the pinky bag frame
+            geometry_msgs::msg::TransformStamped transform = 
+                tf_buffer_->lookupTransform("base_link", frame_name, tf2::TimePointZero, tf2::durationFromSec(1.0));
+            
+            // Convert transform to pose
+            geometry_msgs::msg::Pose pose;
+            pose.position.x = transform.transform.translation.x;
+            pose.position.y = transform.transform.translation.y;
+            pose.position.z = transform.transform.translation.z;
+            pose.orientation = transform.transform.rotation;
+            
+            // Create box collision object (representing pinky bag dimensions)
+            // Typical pinky bag dimensions: 0.2m x 0.15m x 0.1m (length x width x height)
+            std::vector<double> dimensions = {0.075, 0.115, 0.001};
+            auto collision_object = createBoxCollisionObject(collision_id, pose, dimensions);
+            
+            collision_objects.push_back(collision_object);
+            
+            RCLCPP_INFO(get_logger(), "Created collision object: %s at frame %s", 
+                       collision_id.c_str(), frame_name.c_str());
+            
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_WARN(get_logger(), "Could not get transform for %s to create collision: %s", 
+                       frame_name.c_str(), ex.what());
+        }
+    }
+    
+    // Add all collision objects to the planning scene
+    if (!collision_objects.empty()) {
+        planning_scene_interface_->addCollisionObjects(collision_objects);
+        RCLCPP_INFO(get_logger(), "Added %zu collision objects to planning scene", collision_objects.size());
+    }
+}
+
+moveit_msgs::msg::CollisionObject TagPicker::createBoxCollisionObject(
+    const std::string& object_id,
+    const geometry_msgs::msg::Pose& pose,
+    const std::vector<double>& dimensions)
+{
+    moveit_msgs::msg::CollisionObject collision_object;
+    collision_object.header.frame_id = "base_link";
+    collision_object.header.stamp = this->get_clock()->now();
+    collision_object.id = object_id;
+    
+    // Define the box primitive
+    shape_msgs::msg::SolidPrimitive primitive;
+    primitive.type = primitive.BOX;
+    primitive.dimensions.resize(3);
+    primitive.dimensions[primitive.BOX_X] = dimensions[0]; // length
+    primitive.dimensions[primitive.BOX_Y] = dimensions[1]; // width  
+    primitive.dimensions[primitive.BOX_Z] = dimensions[2]; // height
+    
+    // Set pose and primitive
+    collision_object.primitives.push_back(primitive);
+    collision_object.primitive_poses.push_back(pose);
+    collision_object.operation = collision_object.ADD;
+    
+    return collision_object;
+}
+
+void TagPicker::removeCollisionObjectsForMissingTags(int source_tag_id)
+{
+    std::vector<std::string> collision_ids_to_remove;
+    
+    if (source_tag_id == -1) {
+        // SCAN_FRONT command - check which tags 31, 32, 33 are missing
+        std::vector<int> expected_tags = {31, 32, 33};
+        std::vector<std::string> pinky_namespaces = {"pinky1", "pinky2", "pinky3"};
+        
+        for (size_t i = 0; i < expected_tags.size(); i++) {
+            int tag_id = expected_tags[i];
+            const std::string& pinky_namespace = pinky_namespaces[i];
+            
+            // Check if this tag was detected
+            if (detected_tag_ids_.find(tag_id) == detected_tag_ids_.end()) {
+                // Tag not detected, mark collision object for removal
+                collision_ids_to_remove.push_back(pinky_namespace + "_bag_collision");
+                RCLCPP_INFO(get_logger(), "Tag %d not detected, will remove collision object: %s_bag_collision", 
+                           tag_id, pinky_namespace.c_str());
+            }
+        }
+    } else if (source_tag_id == 31 || source_tag_id == 32 || source_tag_id == 33) {
+        // SCAN_PINKY command - remove collision for specific tag (called when tag not visible)
+        std::string pinky_namespace = (source_tag_id == 31) ? "pinky1" : 
+                                    (source_tag_id == 32) ? "pinky2" : "pinky3";
+        collision_ids_to_remove.push_back(pinky_namespace + "_bag_collision");
+        RCLCPP_INFO(get_logger(), "Tag %d not visible after approach, removing collision object: %s_bag_collision", 
+                   source_tag_id, pinky_namespace.c_str());
+    }
+    
+    // Remove collision objects from planning scene
+    if (!collision_ids_to_remove.empty()) {
+        planning_scene_interface_->removeCollisionObjects(collision_ids_to_remove);
+        RCLCPP_INFO(get_logger(), "Removed %zu collision objects from planning scene", collision_ids_to_remove.size());
+    } else {
+        RCLCPP_DEBUG(get_logger(), "No collision objects to remove - all expected tags detected");
+    }
 }
 
 bool TagPicker::handlePickAndPlaceCommand(const std::shared_ptr<GoalHandlePickerAction> goal_handle)
